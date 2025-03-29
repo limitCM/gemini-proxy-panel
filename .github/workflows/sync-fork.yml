@@ -10,13 +10,17 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       is_fork: ${{ steps.check.outputs.is_fork }}
+      repo_name: ${{ steps.check.outputs.repo_name }}
     steps:
       - id: check
         run: |
           if [ "${{ github.repository_owner }}" != "dreamhartley" ]; then
             echo "is_fork=true" >> $GITHUB_OUTPUT
+            REPO_NAME=$(echo "${{ github.repository }}" | cut -d "/" -f 2)
+            echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
           else
             echo "is_fork=false" >> $GITHUB_OUTPUT
+            echo "repo_name=none" >> $GITHUB_OUTPUT
           fi
 
   sync-and-deploy:
@@ -28,11 +32,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          token: ${{ secrets.PAT }}
+          token: ${{ secrets.PAT || github.token }}
       
-      - name: Add upstream remote
+      - name: Configure upstream repository
         run: |
-          git remote add upstream https://github.com/dreamhartley/gemini-proxy-panel.git
+          REPO_NAME="${{ needs.check-if-fork.outputs.repo_name }}"
+          
+          if [[ "$REPO_NAME" == *"-free"* ]]; then
+            echo "Setting upstream to gemini-proxy-panel-free"
+            UPSTREAM_REPO="dreamhartley/gemini-proxy-panel-free"
+          else
+            echo "Setting upstream to gemini-proxy-panel"
+            UPSTREAM_REPO="dreamhartley/gemini-proxy-panel"
+          fi
+          
+          git remote add upstream https://github.com/$UPSTREAM_REPO.git
           git fetch upstream
       
       - name: Sync fork with upstream
