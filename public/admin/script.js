@@ -21,6 +21,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const modelCategorySelect = document.getElementById('model-category');
     const customQuotaDiv = document.getElementById('custom-quota-div');
     const modelQuotaInput = document.getElementById('model-quota');
+    const modelIdInput = document.getElementById('model-id');
     const setCategoryQuotasBtn = document.getElementById('set-category-quotas-btn');
     const categoryQuotasModal = document.getElementById('category-quotas-modal');
     const closeCategoryQuotasModalBtn = document.getElementById('close-category-quotas-modal');
@@ -36,6 +37,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // --- Global Cache ---
     let cachedModels = [];
+    let cachedGeminiModels = []; // Add cache for available Gemini models
     let cachedCategoryQuotas = { proQuota: 0, flashQuota: 0 };
 
     // --- Utility Functions ---
@@ -614,6 +616,165 @@ function hideError(container = errorMessageDiv) {
         return quotas;
     }
 
+    // New function to load available Gemini models
+    async function loadGeminiAvailableModels() {
+        // Only proceed if we have Gemini keys
+        const geminiKeysList = document.querySelectorAll('#gemini-keys-list .card-item');
+        if (geminiKeysList.length === 0) {
+            console.log("No Gemini keys available, skipping model list fetch");
+            return;
+        }
+        
+        try {
+            const models = await apiFetch('/gemini-models');
+            if (models && Array.isArray(models)) {
+                cachedGeminiModels = models;
+                
+                // Update the model-id input field to include dropdown
+                updateModelIdDropdown(models);
+                
+                console.log(`Loaded ${models.length} available Gemini models`);
+            }
+        } catch (error) {
+            console.error("Failed to load Gemini models:", error);
+        }
+    }
+
+    // Update the model-id input to include dropdown functionality
+    function updateModelIdDropdown(models) {
+        if (!modelIdInput) return;
+        
+        // Create custom dropdown menu
+        const createCustomDropdown = () => {
+            // Remove old dropdown menu (if it exists)
+            const existingDropdown = document.getElementById('custom-model-dropdown');
+            if (existingDropdown) {
+                existingDropdown.remove();
+            }
+            
+            // Create new dropdown menu container
+            const dropdownContainer = document.createElement('div');
+            dropdownContainer.id = 'custom-model-dropdown';
+            dropdownContainer.className = 'absolute z-10 mt-1 w-full bg-white shadow-lg max-h-60 rounded-md py-1 text-base overflow-auto focus:outline-none sm:text-sm hidden';
+            dropdownContainer.style.maxHeight = '200px';
+            dropdownContainer.style.overflowY = 'auto';
+            dropdownContainer.style.border = '1px solid #d1d5db';
+            
+            // Add model options to the dropdown menu
+            models.forEach(model => {
+                const option = document.createElement('div');
+                option.className = 'cursor-pointer select-none relative py-2 pl-3 pr-9 hover:bg-gray-100';
+                option.textContent = model.id;
+                option.dataset.value = model.id;
+                
+                option.addEventListener('click', () => {
+                    modelIdInput.value = model.id;
+                    dropdownContainer.classList.add('hidden');
+                    
+                    // Automatically select category based on model name
+                    const modelValue = model.id.toLowerCase();
+                    if (modelValue.includes('pro')) {
+                        modelCategorySelect.value = 'Pro';
+                        customQuotaDiv.classList.add('hidden');
+                        modelQuotaInput.required = false;
+                    } else if (modelValue.includes('flash')) {
+                        modelCategorySelect.value = 'Flash';
+                        customQuotaDiv.classList.add('hidden');
+                        modelQuotaInput.required = false;
+                    }
+                    
+                    // Trigger input event so other listeners can respond
+                    modelIdInput.dispatchEvent(new Event('input'));
+                });
+                
+                dropdownContainer.appendChild(option);
+            });
+            
+            // Add the dropdown menu to the input element's parent
+            modelIdInput.parentNode.appendChild(dropdownContainer);
+            
+            return dropdownContainer;
+        };
+        
+        // Create dropdown menu
+        const dropdown = createCustomDropdown();
+        console.log(`Created custom dropdown with ${models.length} model options`);
+        
+        // Add input event to automatically select category based on model name and filter dropdown options
+        modelIdInput.addEventListener('input', function() {
+            const modelValue = this.value.toLowerCase();
+            
+            // Filter dropdown options based on input value
+            const options = dropdown.querySelectorAll('div[data-value]');
+            let hasVisibleOptions = false;
+            
+            options.forEach(option => {
+                const optionValue = option.dataset.value.toLowerCase();
+                if (optionValue.includes(modelValue)) {
+                    option.style.display = 'block';
+                    hasVisibleOptions = true;
+                } else {
+                    option.style.display = 'none';
+                }
+            });
+            
+            // If there are matching options, show the dropdown menu
+            if (hasVisibleOptions && modelValue) {
+                dropdown.classList.remove('hidden');
+            } else {
+                dropdown.classList.add('hidden');
+            }
+            
+            // Automatically select category based on input value
+            if (modelValue.includes('pro')) {
+                modelCategorySelect.value = 'Pro';
+                customQuotaDiv.classList.add('hidden');
+                modelQuotaInput.required = false;
+            } else if (modelValue.includes('flash')) {
+                modelCategorySelect.value = 'Flash';
+                customQuotaDiv.classList.add('hidden');
+                modelQuotaInput.required = false;
+            }
+        });
+        
+        // Add click event to show the dropdown menu
+        modelIdInput.addEventListener('click', function() {
+            if (models.length > 0) {
+                // Show all options
+                const options = dropdown.querySelectorAll('div[data-value]');
+                options.forEach(option => {
+                    option.style.display = 'block';
+                });
+                
+                dropdown.classList.remove('hidden');
+            }
+        });
+        
+        // Hide dropdown menu when clicking elsewhere on the page
+        document.addEventListener('click', function(e) {
+            if (e.target !== modelIdInput && !dropdown.contains(e.target)) {
+                dropdown.classList.add('hidden');
+            }
+        });
+        
+        // Keep the original datalist as a backup
+        let datalist = document.getElementById('model-suggestions');
+        if (!datalist) {
+            datalist = document.createElement('datalist');
+            datalist.id = 'model-suggestions';
+            modelIdInput.parentNode.appendChild(datalist);
+        }
+        
+        datalist.innerHTML = '';
+        models.forEach(model => {
+            const option = document.createElement('option');
+            option.value = model.id;
+            datalist.appendChild(option);
+        });
+        
+        modelIdInput.setAttribute('list', 'model-suggestions');
+    }
+
 
     // --- Event Handlers ---
 
@@ -950,6 +1111,8 @@ function hideError(container = errorMessageDiv) {
             }
 
             await loadGeminiKeys();
+            // After loading Gemini keys, try to load available Gemini models
+            await loadGeminiAvailableModels();
 
 
         } catch (error) {

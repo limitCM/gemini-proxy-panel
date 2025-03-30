@@ -232,11 +232,12 @@ function parseDataUri(dataUri: string): { mimeType: string; data: string } | nul
 }
 
 // Helper to transform OpenAI request body parts (messages, tools) to Gemini format
-function transformOpenAiToGemini(requestBody: any): { contents: any[]; systemInstruction?: any; tools?: any[] } {
+// Added requestedModelId parameter
+function transformOpenAiToGemini(requestBody: any, requestedModelId?: string): { contents: any[]; systemInstruction?: any; tools?: any[] } {
 	const messages = requestBody.messages || [];
 	const openAiTools = requestBody.tools;
 
-	// 1. Transform Messages (existing logic)
+	// 1. Transform Messages
 	const contents: any[] = [];
 	let systemInstruction: any | undefined = undefined;
 	messages.forEach((msg: any) => {
@@ -252,18 +253,28 @@ function transformOpenAiToGemini(requestBody: any): { contents: any[]; systemIns
 				role = 'model';
 				break;
 			case 'system':
-				if (typeof msg.content === 'string') {
-					systemInstruction = { role: "system", parts: [{ text: msg.content }] };
-				} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
-					const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
-					if (textContent) {
-						systemInstruction = { role: "system", parts: [{ text: textContent }] };
+				// Check if the model is gemma-based
+				if (requestedModelId && requestedModelId.startsWith('gemma')) {
+					// If gemma, treat system prompt as a user message
+					console.log(`Gemma model detected (${requestedModelId}). Treating system message as user message.`);
+					role = 'user';
+					// Content processing for 'user' role will happen below
+				} else {
+					// Original logic for non-gemma models: create systemInstruction
+					if (typeof msg.content === 'string') {
+						systemInstruction = { role: "system", parts: [{ text: msg.content }] };
+					} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
+						const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
+						if (textContent) {
+							systemInstruction = { role: "system", parts: [{ text: textContent }] };
+						}
 					}
+					return; // Skip adding this message to 'contents' for non-gemma
 				}
-				return;
+				break; // Break for 'system' role (gemma case falls through to content processing)
 			default:
 				console.warn(`Unknown role encountered: ${msg.role}. Skipping message.`);
-				return;
+				return; // Skip unknown roles
 		}
 
 		// 2. Map Content to Parts (existing logic)
@@ -616,11 +627,11 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 
 
 	// --- Transform Request Body ---
-	// Use the updated transformation function
-	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody);
+	// Pass requestedModelId to the transformation function
+	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody, requestedModelId);
 	if (contents.length === 0 && !systemInstruction) {
-		// Allow requests with only tools defined? Let's require at least one message for now.
-		return new Response(JSON.stringify({ error: "No valid user, assistant, or system messages found." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
+		// Require at least one message even if tools are present
+		return new Response(JSON.stringify({ error: "No valid user, assistant messages found (system messages converted for gemma)." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 
 	let safetyEnabled = true; 
@@ -835,6 +846,59 @@ async function handleV1Models(request: Request, env: Env, ctx: ExecutionContext)
 }
 
 // --- Admin API Handler ---
+async function handleAdminGeminiModels(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
+
+  if (request.method !== 'GET') {
+    return new Response(JSON.stringify({ error: `Method ${request.method} not allowed for gemini-models` }),
+      { status: 405, headers: { ...headers, 'Allow': 'GET' } });
+  }
+
+  // First check if there are any available Gemini API Keys
+  const selectedKey = await getNextAvailableGeminiKey(env, ctx);
+  if (!selectedKey) {
+    // No available keys, return empty array
+    return new Response(JSON.stringify([]), { headers });
+  }
+
+  // Use the available key to request Gemini models list
+  try {
+    // Corrected URL and authentication method (using ?key= query parameter)
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${selectedKey.key}`;
+    const response = await fetch(geminiUrl, {
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        // Removed Authorization header
+      }
+    });
+
+    if (!response.ok) {
+      const errorBody = await response.text();
+      console.error(`Error fetching Gemini models: ${response.status} ${response.statusText}`, errorBody);
+      // Return empty array on error, as before
+      return new Response(JSON.stringify([]), { headers });
+    }
+
+    const data = await response.json();
+    // Process response - the structure is { models: [...] } as confirmed by user feedback
+    const processedModels = (data.models || []).map((model: any) => {
+      // Extract the model ID after "models/"
+      const modelId = model.name?.startsWith('models/') ? model.name.substring(7) : model.name;
+      return {
+        id: modelId, // Use the extracted ID
+        object: 'model',
+        owned_by: 'google' // Assuming all are Google models
+      };
+    });
+
+    return new Response(JSON.stringify(processedModels), { headers });
+  } catch (error) {
+    console.error('Error fetching Gemini models:', error);
+    return new Response(JSON.stringify([]), { headers });
+  }
+}
+
 async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 	const url = new URL(request.url);
 	const pathSegments = url.pathname.split('/').filter(Boolean); // e.g., ['api', 'admin', 'gemini-keys']
@@ -858,6 +922,8 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
 				return await handleAdminCategoryQuotas(request, env, ctx);
 			case 'test-gemini-key':
 				return await handleTestGeminiKey(request, env, ctx);
+			case 'gemini-models':
+				return await handleAdminGeminiModels(request, env, ctx);
 			default:
 				return new Response(JSON.stringify({ error: "Unknown admin resource" }), { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 		}
@@ -974,13 +1040,22 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 						let modelUsageData: Record<string, { count: number; quota?: number }> = {};
 						let categoryUsageData = { pro: 0, flash: 0 };
 
+						Object.entries(modelsConfig).forEach(([modelId, modelConfig]) => {
+							if (modelConfig.category === 'Custom') {
+								modelUsageData[modelId] = {
+									count: 0, 
+									quota: modelConfig.dailyQuota
+								};
+							}
+						});
+
 						if (keyInfoData.usageDate === todayInLA) {
 							if (keyInfoData.modelUsage) {
 								Object.entries(keyInfoData.modelUsage).forEach(([modelId, count]) => {
 									if (modelsConfig[modelId]?.category === 'Custom') {
 										modelUsageData[modelId] = {
-											count,
-											quota: modelsConfig[modelId]?.dailyQuota // Get quota from model config
+											count: typeof count === 'number' ? count : 0,
+											quota: modelsConfig[modelId]?.dailyQuota
 										};
 									}
 								});
