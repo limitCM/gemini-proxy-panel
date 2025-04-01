@@ -28,6 +28,7 @@ const KV_KEY_GEMINI_KEY_INDEX = "_config:key_index";
 interface ModelConfig {
 	category: 'Pro' | 'Flash' | 'Custom';
 	dailyQuota?: number; // Only applicable for 'Custom' category
+	individualQuota?: number; // Individual quota for Pro/Flash models
 }
 
 // Define the structure for category quotas
@@ -45,6 +46,7 @@ interface GeminiKeyInfo {
 	modelUsage?: Record<string, number>;
 	categoryUsage?: { pro: number; flash: number };
 	name?: string;
+	errorStatus?: 401 | 403 | null; // Added to track 401/403 errors
 }
 
 /**
@@ -232,8 +234,8 @@ function parseDataUri(dataUri: string): { mimeType: string; data: string } | nul
 }
 
 // Helper to transform OpenAI request body parts (messages, tools) to Gemini format
-// Added requestedModelId parameter
-function transformOpenAiToGemini(requestBody: any, requestedModelId?: string): { contents: any[]; systemInstruction?: any; tools?: any[] } {
+// Added requestedModelId and safetyEnabled parameters
+function transformOpenAiToGemini(requestBody: any, requestedModelId?: string, safetyEnabled: boolean = true): { contents: any[]; systemInstruction?: any; tools?: any[] } {
 	const messages = requestBody.messages || [];
 	const openAiTools = requestBody.tools;
 
@@ -253,25 +255,34 @@ function transformOpenAiToGemini(requestBody: any, requestedModelId?: string): {
 				role = 'model';
 				break;
 			case 'system':
-				// Check if the model is gemma-based
-				if (requestedModelId && requestedModelId.startsWith('gemma')) {
-					// If gemma, treat system prompt as a user message
-					console.log(`Gemma model detected (${requestedModelId}). Treating system message as user message.`);
+				// New logic: Check safetyEnabled first
+				if (!safetyEnabled) {
+					// If safety is OFF, always treat system prompt as a user message
+					console.log(`Safety disabled. Treating system message as user message.`);
 					role = 'user';
 					// Content processing for 'user' role will happen below
 				} else {
-					// Original logic for non-gemma models: create systemInstruction
-					if (typeof msg.content === 'string') {
-						systemInstruction = { role: "system", parts: [{ text: msg.content }] };
-					} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
-						const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
-						if (textContent) {
-							systemInstruction = { role: "system", parts: [{ text: textContent }] };
+					// Safety is ON, apply original logic (Gemma check)
+					if (requestedModelId && requestedModelId.startsWith('gemma')) {
+						// If gemma, treat system prompt as a user message
+						console.log(`Gemma model detected (${requestedModelId}). Treating system message as user message.`);
+						role = 'user';
+						// Content processing for 'user' role will happen below
+					} else {
+						// Original logic for non-gemma models with safety ON: create systemInstruction
+						if (typeof msg.content === 'string') {
+							systemInstruction = { role: "system", parts: [{ text: msg.content }] };
+						} else if (Array.isArray(msg.content)) { // Handle complex system prompts if needed
+							const textContent = msg.content.find((p: any) => p.type === 'text')?.text;
+							if (textContent) {
+								systemInstruction = { role: "system", parts: [{ text: textContent }] };
+							}
 						}
+						// Skip adding this message to 'contents' when creating systemInstruction
+						return; 
 					}
-					return; // Skip adding this message to 'contents' for non-gemma
 				}
-				break; // Break for 'system' role (gemma case falls through to content processing)
+				break; // Break for 'system' role (both safety off and gemma cases fall through to content processing)
 			default:
 				console.warn(`Unknown role encountered: ${msg.role}. Skipping message.`);
 				return; // Skip unknown roles
@@ -552,8 +563,8 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	// Get and store Worker API Key for later use
 	workerApiKey = request.headers.get('Authorization')?.replace('Bearer ', '') || null;
 
-	// --- Key Selection (Remains the same) ---
-	const selectedKey = await getNextAvailableGeminiKey(env, ctx);
+	// --- Key Selection (Using weighted selection) ---
+	const selectedKey = await getNextAvailableGeminiKey(env, ctx, requestedModelId);
 	if (!selectedKey) {
 		return new Response(JSON.stringify({ error: "No available Gemini API Key configured." }), { status: 503, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
@@ -594,23 +605,44 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 		// Check quota based on category
 		switch (modelCategory) {
 			case 'Pro':
+				// First check category quota
 				quotaLimit = categoryQuotasConfig?.proQuota ?? Infinity;
 				currentUsage = keyInfoData.categoryUsage?.pro ?? 0;
 				if (currentUsage >= quotaLimit) {
 					quotaExceeded = true;
 					console.warn(`Key ${selectedKey.id} Pro category usage (${currentUsage}) meets or exceeds quota (${quotaLimit}).`);
+				} 
+				// If category quota is fine, also check individual quota if set
+				else if (modelInfo.individualQuota) {
+					const individualQuota = modelInfo.individualQuota;
+					const modelSpecificUsage = keyInfoData.modelUsage?.[requestedModelId] ?? 0;
+					if (modelSpecificUsage >= individualQuota) {
+						quotaExceeded = true;
+						console.warn(`Key ${selectedKey.id} Pro model '${requestedModelId}' individual quota usage (${modelSpecificUsage}) meets or exceeds individual quota (${individualQuota}).`);
+					}
 				}
 				break;
 			case 'Flash':
+				// First check category quota
 				quotaLimit = categoryQuotasConfig?.flashQuota ?? Infinity;
 				currentUsage = keyInfoData.categoryUsage?.flash ?? 0;
 				if (currentUsage >= quotaLimit) {
 					quotaExceeded = true;
 					console.warn(`Key ${selectedKey.id} Flash category usage (${currentUsage}) meets or exceeds quota (${quotaLimit}).`);
+				} 
+				// If category quota is fine, also check individual quota if set
+				else if (modelInfo.individualQuota) {
+					const individualQuota = modelInfo.individualQuota;
+					const modelSpecificUsage = keyInfoData.modelUsage?.[requestedModelId] ?? 0;
+					if (modelSpecificUsage >= individualQuota) {
+						quotaExceeded = true;
+						console.warn(`Key ${selectedKey.id} Flash model '${requestedModelId}' individual quota usage (${modelSpecificUsage}) meets or exceeds individual quota (${individualQuota}).`);
+					}
 				}
 				break;
 			case 'Custom':
-				quotaLimit = modelInfo.dailyQuota ?? Infinity; // Use model-specific quota
+				// Custom models don't use individual quota
+				quotaLimit = modelInfo.dailyQuota ?? Infinity;
 				currentUsage = keyInfoData.modelUsage?.[requestedModelId] ?? 0;
 				if (currentUsage >= quotaLimit) {
 					quotaExceeded = true;
@@ -626,14 +658,7 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	// --- End New Quota Check ---
 
 
-	// --- Transform Request Body ---
-	// Pass requestedModelId to the transformation function
-	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody, requestedModelId);
-	if (contents.length === 0 && !systemInstruction) {
-		// Require at least one message even if tools are present
-		return new Response(JSON.stringify({ error: "No valid user, assistant messages found (system messages converted for gemma)." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
-	}
-
+	// --- Determine Safety Setting ---
 	let safetyEnabled = true; 
 	
 	if (workerApiKey) {
@@ -646,8 +671,16 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				}
 			} catch (e) {
 				console.error("Error parsing safety settings:", e);
+				// Keep safetyEnabled = true on error
 			}
 		}
+	}
+
+	// --- Transform Request Body ---
+	// Pass requestedModelId and safetyEnabled to the transformation function
+	const { contents, systemInstruction, tools: geminiTools } = transformOpenAiToGemini(requestBody, requestedModelId, safetyEnabled);
+	if (contents.length === 0 && !systemInstruction) {
+		return new Response(JSON.stringify({ error: "No valid user, assistant messages found (system messages converted based on safety/gemma)." }), { status: 400, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 	}
 	
 	const geminiRequestBody: any = {
@@ -663,11 +696,11 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	
 	if (!safetyEnabled) {
 		geminiRequestBody.safetySettings = [
-			{ category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
-			{ category: "HARM_CATEGORY_CIVIC_INTEGRITY", threshold: "BLOCK_NONE" }
+			{ category: 'HARM_CATEGORY_HARASSMENT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'OFF' },
+			{ category: 'HARM_CATEGORY_CIVIC_INTEGRITY', threshold: 'BLOCK_NONE' }
 		];
 	}
 
@@ -687,16 +720,36 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 	const querySeparator = stream ? '?alt=sse&' : '?';
 	const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${requestedModelId}:${apiAction}${querySeparator}key=${selectedKey.key}`;
 
-	const headers = new Headers({
-		'Content-Type': 'application/json',
-	});
+	// Prepare headers for Gemini request, removing Cloudflare-specific headers
+	const geminiRequestHeaders = new Headers(); // Start with empty headers
+	geminiRequestHeaders.set('Content-Type', 'application/json'); // Set required content type
+
+	// Add common browser-like headers
+	geminiRequestHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36'); 
+	geminiRequestHeaders.set('Accept', 'application/json, text/plain, */*');
+	geminiRequestHeaders.set('Accept-Language', 'en-US,en;q=0.9'); 
+
+	const cfHeadersToRemove = [
+		'cf-connecting-ip',
+		'cf-ipcountry',
+		'cf-ray',
+		'cf-visitor',
+		'cdn-loop',
+		'x-forwarded-proto', 
+		'x-forwarded-for', 
+		'true-client-ip', 
+	];
+
 
 	try {
 		console.log(`Sending request to Gemini: ${geminiUrl}`);
+		// Log headers being sent to Gemini (excluding API key for security)
+		const headersToSend = new Headers(geminiRequestHeaders); // Clone for logging
+		console.log("Gemini Request Headers:", Object.fromEntries(headersToSend.entries()));
 
 		const geminiResponse = await fetch(geminiUrl, {
 			method: 'POST',
-			headers: headers,
+			headers: geminiRequestHeaders, // Use the cleaned headers
 			body: JSON.stringify(geminiRequestBody),
 		});
 
@@ -715,7 +768,19 @@ async function handleV1ChatCompletions(request: Request, env: Env, ctx: Executio
 				// Force set the quota to its limit for this category/model on this key for today
 				ctx.waitUntil(forceSetQuotaToLimit(selectedKey.id, env, modelCategory, requestedModelId));
 			}
-			// --- End New 429 Handling ---
+			// --- New: Handle 401/403 for error tracking ---
+			if (geminiResponse.status === 401 || geminiResponse.status === 403) {
+				console.warn(`Received ${geminiResponse.status} from Gemini for key ${selectedKey.id}. Recording error status.`);
+				ctx.waitUntil(recordKeyError(selectedKey.id, env, geminiResponse.status as 401 | 403));
+			}
+			// --- End New 401/403 Handling ---
+
+			// --- Existing 429 Handling ---
+			if (geminiResponse.status === 429) {
+				console.warn(`Received 429 from Gemini for key ${selectedKey.id}, category ${modelCategory}${modelCategory === 'Custom' ? ` (model ${requestedModelId})` : ''}. Forcing quota to limit for today.`);
+				ctx.waitUntil(forceSetQuotaToLimit(selectedKey.id, env, modelCategory, requestedModelId));
+			}
+			// --- End Existing 429 Handling ---
 
 			return new Response(JSON.stringify({
 				error: {
@@ -855,7 +920,7 @@ async function handleAdminGeminiModels(request: Request, env: Env, ctx: Executio
   }
 
   // First check if there are any available Gemini API Keys
-  const selectedKey = await getNextAvailableGeminiKey(env, ctx);
+  const selectedKey = await getNextAvailableGeminiKey(env, ctx, undefined);
   if (!selectedKey) {
     // No available keys, return empty array
     return new Response(JSON.stringify([]), { headers });
@@ -924,6 +989,10 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
 				return await handleTestGeminiKey(request, env, ctx);
 			case 'gemini-models':
 				return await handleAdminGeminiModels(request, env, ctx);
+			case 'error-keys': // New route to get keys with errors
+				return await handleAdminGetErrorKeys(request, env, ctx);
+			case 'clear-key-error': // New route to clear a key's error
+				return await handleAdminClearKeyError(request, env, ctx);
 			default:
 				return new Response(JSON.stringify({ error: "Unknown admin resource" }), { status: 404, headers: { 'Content-Type': 'application/json', ...corsHeaders() } });
 		}
@@ -996,7 +1065,15 @@ async function handleTestGeminiKey(request: Request, env: Env, ctx: ExecutionCon
 
 		if (response.ok) {
 			ctx.waitUntil(incrementKeyUsage(body.keyId, env, body.modelId, modelCategory));
+		} else {
+			// --- New: Record 401/403 errors during test ---
+			if (response.status === 401 || response.status === 403) {
+				console.warn(`Received ${response.status} during test for key ${body.keyId}. Recording error status.`);
+				ctx.waitUntil(recordKeyError(body.keyId, env, response.status as 401 | 403));
+			}
+			// --- End New Error Recording ---
 		}
+
 
 		return new Response(JSON.stringify({
 			success: response.ok,
@@ -1012,6 +1089,92 @@ async function handleTestGeminiKey(request: Request, env: Env, ctx: ExecutionCon
 }
 
 // --- Admin API Resource Handlers ---
+
+// New handler to get keys with errors
+async function handleAdminGetErrorKeys(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
+	if (request.method !== 'GET') {
+		return new Response(JSON.stringify({ error: `Method ${request.method} not allowed for error-keys` }),
+			{ status: 405, headers: { ...headers, 'Allow': 'GET' } });
+	}
+
+	try {
+		const listResult = await env.GEMINI_KEYS_KV.list({ prefix: 'key:' });
+		const errorKeyPromises = listResult.keys.map(async (keyMeta) => {
+			const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyMeta.name);
+			if (!keyInfoJson) return null;
+			try {
+				const keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+				if (keyInfoData.errorStatus === 401 || keyInfoData.errorStatus === 403) {
+					const keyId = keyMeta.name.replace('key:', '');
+					return {
+						id: keyId,
+						name: keyInfoData.name || keyId,
+						error: keyInfoData.errorStatus,
+					};
+				}
+				return null;
+			} catch (e) {
+				console.error(`Error processing error status for key ${keyMeta.name}:`, e);
+				return null;
+			}
+		});
+
+		const errorKeys = (await Promise.all(errorKeyPromises)).filter(k => k !== null);
+		return new Response(JSON.stringify(errorKeys), { headers });
+
+	} catch (error) {
+		console.error(`Error handling admin API for Error Keys:`, error);
+		const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
+		return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers });
+	}
+}
+
+// New handler to clear a key's error status
+async function handleAdminClearKeyError(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
+	if (request.method !== 'POST') {
+		return new Response(JSON.stringify({ error: `Method ${request.method} not allowed for clear-key-error` }),
+			{ status: 405, headers: { ...headers, 'Allow': 'POST' } });
+	}
+
+	const body = await readRequestBody<{ keyId: string }>(request);
+	if (!body || typeof body.keyId !== 'string' || body.keyId.trim() === '') {
+		return new Response(JSON.stringify({ error: 'Request body must include a valid non-empty string: keyId' }), { status: 400, headers });
+	}
+
+	const keyIdToClear = body.keyId.trim();
+	const keyKvName = `key:${keyIdToClear}`;
+
+	try {
+		const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
+		if (!keyInfoJson) {
+			return new Response(JSON.stringify({ error: `Key with ID '${keyIdToClear}' not found.` }), { status: 404, headers });
+		}
+
+		let keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+
+		if (keyInfoData.errorStatus === null || keyInfoData.errorStatus === undefined) {
+			// No error to clear, but still return success
+			return new Response(JSON.stringify({ success: true, id: keyIdToClear, message: "No error status to clear." }), { headers });
+		}
+
+		// Clear the error status
+		keyInfoData.errorStatus = null;
+
+		// Save back to KV
+		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(keyInfoData));
+		console.log(`Cleared error status for key ${keyIdToClear}.`);
+
+		return new Response(JSON.stringify({ success: true, id: keyIdToClear }), { headers });
+
+	} catch (error) {
+		console.error(`Error clearing error status for key ${keyIdToClear}:`, error);
+		const errorMessage = error instanceof Error ? error.message : 'Internal Server Error';
+		return new Response(JSON.stringify({ error: errorMessage }), { status: 500, headers });
+	}
+}
+
 
 async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionContext, resourceId?: string): Promise<Response> {
 	const headers = { 'Content-Type': 'application/json', ...corsHeaders() };
@@ -1036,32 +1199,41 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 						const keyInfoData = JSON.parse(keyInfoJson) as Partial<Omit<GeminiKeyInfo, 'id'>>;
 						const keyId = keyMeta.name.replace('key:', '');
 						const todayInLA = getTodayInLA();
+						const isQuotaReset = keyInfoData.usageDate !== todayInLA;
 
 						let modelUsageData: Record<string, { count: number; quota?: number }> = {};
 						let categoryUsageData = { pro: 0, flash: 0 };
 
+						// Populate modelUsageData for all relevant models (Custom or Pro/Flash with individualQuota)
 						Object.entries(modelsConfig).forEach(([modelId, modelConfig]) => {
+							let quota: number | undefined = undefined;
+							let shouldInclude = false;
+
 							if (modelConfig.category === 'Custom') {
+								quota = modelConfig.dailyQuota;
+								shouldInclude = true; // Always include Custom models
+							} else if ((modelConfig.category === 'Pro' || modelConfig.category === 'Flash') && modelConfig.individualQuota) {
+								quota = modelConfig.individualQuota;
+								shouldInclude = true; // Include Pro/Flash if they have individualQuota
+							}
+
+							if (shouldInclude) {
+								const count = isQuotaReset 
+									? 0 
+									: (keyInfoData.modelUsage?.[modelId] ?? 0);
+								
 								modelUsageData[modelId] = {
-									count: 0, 
-									quota: modelConfig.dailyQuota
+									count: typeof count === 'number' ? count : 0, // Ensure count is a number
+									quota: quota
 								};
 							}
 						});
+						
+						// Populate categoryUsageData
+						categoryUsageData = isQuotaReset 
+							? { pro: 0, flash: 0 } 
+							: (keyInfoData.categoryUsage || { pro: 0, flash: 0 });
 
-						if (keyInfoData.usageDate === todayInLA) {
-							if (keyInfoData.modelUsage) {
-								Object.entries(keyInfoData.modelUsage).forEach(([modelId, count]) => {
-									if (modelsConfig[modelId]?.category === 'Custom') {
-										modelUsageData[modelId] = {
-											count: typeof count === 'number' ? count : 0,
-											quota: modelsConfig[modelId]?.dailyQuota
-										};
-									}
-								});
-							}
-							categoryUsageData = keyInfoData.categoryUsage || { pro: 0, flash: 0 };
-						}
 
 						return {
 							id: keyId,
@@ -1071,7 +1243,8 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 							usageDate: keyInfoData.usageDate || 'N/A',
 							modelUsage: modelUsageData, 
 							categoryUsage: categoryUsageData,
-							categoryQuotas: categoryQuotas
+							categoryQuotas: categoryQuotas,
+							errorStatus: keyInfoData.errorStatus // Include error status
 						};
 					} catch (e) {
 						console.error(`Error processing key ${keyMeta.name}:`, e);
@@ -1118,7 +1291,8 @@ async function handleAdminGeminiKeys(request: Request, env: Env, ctx: ExecutionC
 					usageDate: '', 
 					name: keyName,
 					modelUsage: {},
-					categoryUsage: { pro: 0, flash: 0 }
+					categoryUsage: { pro: 0, flash: 0 },
+					errorStatus: null // Initialize error status
 				};
 
 				await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(newKeyInfo));
@@ -1326,14 +1500,21 @@ async function handleAdminModels(request: Request, env: Env, ctx: ExecutionConte
 				const modelList = Object.entries(modelsConfig).map(([id, data]) => ({
 					id: id,
 					category: data.category,
-					dailyQuota: data.dailyQuota
+					dailyQuota: data.dailyQuota,
+					individualQuota: data.individualQuota
 				}));
 				return new Response(JSON.stringify(modelList), { headers });
 			}
 
 			case 'POST': {
 				// Add or update a model with category
-				const body = await readRequestBody<{ id: string; category: 'Pro' | 'Flash' | 'Custom'; dailyQuota?: number | string }>(request);
+				const body = await readRequestBody<{ 
+					id: string; 
+					category: 'Pro' | 'Flash' | 'Custom'; 
+					dailyQuota?: number | string;
+					individualQuota?: number;
+				}>(request);
+				
 				if (!body || typeof body.id !== 'string' || body.id.trim() === '') {
 					return new Response(JSON.stringify({ error: 'Request body must include a valid non-empty string: id' }), { status: 400, headers });
 				}
@@ -1343,6 +1524,7 @@ async function handleAdminModels(request: Request, env: Env, ctx: ExecutionConte
 				const modelId = body.id.trim();
 				const category = body.category;
 
+				// Process the dailyQuota (mainly for Custom models)
 				let newQuota: number | undefined = undefined;
 				if (category === 'Custom') {
 					if (body.dailyQuota !== undefined && body.dailyQuota !== null && body.dailyQuota !== '') {
@@ -1358,15 +1540,36 @@ async function handleAdminModels(request: Request, env: Env, ctx: ExecutionConte
 							}
 						}
 					}
-				} else {
-					newQuota = undefined;
 				}
 
-				const isUpdate = modelsConfig.hasOwnProperty(modelId);
-				modelsConfig[modelId] = { category: category, dailyQuota: newQuota };
+				// Process the individualQuota (for Pro and Flash models)
+				let individualQuota: number | undefined = undefined;
+				if ((category === 'Pro' || category === 'Flash') && body.individualQuota !== undefined) {
+					if (typeof body.individualQuota === 'number' && body.individualQuota > 0) {
+						individualQuota = body.individualQuota;
+					}
+				}
 
+				// Check if this is an update or a new model
+				const isUpdate = modelsConfig.hasOwnProperty(modelId);
+				
+				// Create or update the model
+				modelsConfig[modelId] = { 
+					category: category, 
+					dailyQuota: newQuota, 
+					individualQuota: individualQuota 
+				};
+
+				// Save to KV store
 				await env.WORKER_CONFIG_KV.put(KV_KEY_MODELS, JSON.stringify(modelsConfig));
-				return new Response(JSON.stringify({ success: true, id: modelId, category: category, dailyQuota: newQuota }), { status: isUpdate ? 200 : 201, headers });
+				
+				return new Response(JSON.stringify({ 
+					success: true, 
+					id: modelId, 
+					category: category, 
+					dailyQuota: newQuota,
+					individualQuota: individualQuota 
+				}), { status: isUpdate ? 200 : 201, headers });
 			}
 
 			case 'DELETE': {
@@ -1681,11 +1884,11 @@ function handleLogoutRequest(): Response {
 // --- Gemini Key Management ---
 
 /**
- * Finds the next available Gemini API Key based on round-robin.
- * Does NOT check quota here. Quota check happens in handleV1ChatCompletions based on the requested model.
- * Updates the round-robin index for the next request.
+ * Selects an API key based on weight. Weight is based on the number of times the key has been used; the fewer times used, the higher the weight.
+ * Weight calculation considers the requested model ID; different models have independent usage counts.
+ * Quota checking is not performed here; it is done in handleV1ChatCompletions.
  */
-async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext): Promise<{ id: string; key: string } | null> { // Return only id and key
+async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext, requestedModelId?: string): Promise<{ id: string; key: string } | null> {
 	try {
 		const keyListJson = await env.GEMINI_KEYS_KV.get(KV_KEY_GEMINI_KEY_LIST);
 		const keyList: string[] = keyListJson ? JSON.parse(keyListJson) : [];
@@ -1695,49 +1898,106 @@ async function getNextAvailableGeminiKey(env: Env, ctx: ExecutionContext): Promi
 			return null;
 		}
 
-		const indexStr = await env.GEMINI_KEYS_KV.get(KV_KEY_GEMINI_KEY_INDEX);
-		let currentIndex = indexStr ? parseInt(indexStr, 10) : 0;
-		if (isNaN(currentIndex) || currentIndex < 0 || currentIndex >= keyList.length) {
-			currentIndex = 0; // Reset if index is invalid
-		}
+		// Get today's date (Los Angeles timezone)
+		const todayInLA = getTodayInLA();
+		
+		// Get information for each key and calculate weight
+		const keysWithWeights: Array<{
+			id: string;
+			key: string;
+			weight: number;
+			usage: number;
+			modelUsage: number;
+		}> = [];
 
-		// Iterate through keys starting from currentIndex, max one full loop
-		for (let i = 0; i < keyList.length; i++) {
-			const keyIndexToCheck = (currentIndex + i) % keyList.length;
-			const keyId = keyList[keyIndexToCheck];
+		for (const keyId of keyList) {
 			const keyKvName = `key:${keyId}`;
-
 			const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
+			
 			if (!keyInfoJson) {
 				console.warn(`Key info not found for ID: ${keyId} listed in ${KV_KEY_GEMINI_KEY_LIST}. Skipping.`);
 				continue;
 			}
 
 			try {
-				// IMPORTANT: Parse the JSON string from KV
-				const keyInfoData = JSON.parse(keyInfoJson) as Partial<Omit<GeminiKeyInfo, 'id'>>; // Use Partial for safety
+				// Parse the JSON string from KV
+				const keyInfoData = JSON.parse(keyInfoJson) as Partial<Omit<GeminiKeyInfo, 'id'>>;
 
-				// Key exists, select it for round-robin
-				console.log(`Selected Gemini Key ID via round-robin: ${keyId}`);
-
-				// Update the index for the *next* request in the background
-				const nextIndex = (keyIndexToCheck + 1) % keyList.length;
-				ctx.waitUntil(env.GEMINI_KEYS_KV.put(KV_KEY_GEMINI_KEY_INDEX, nextIndex.toString()));
-
-				// Return only the ID and the key value needed for the request
-				return {
+				// --- New: Skip keys with 401/403 errors ---
+				if (keyInfoData.errorStatus === 401 || keyInfoData.errorStatus === 403) {
+					console.log(`Skipping key ${keyId} due to error status: ${keyInfoData.errorStatus}`);
+					continue; // Skip this key
+				}
+				// --- End New ---
+				
+				// If the key's usage date is not today, its usage should be considered 0
+				const isCurrentDay = keyInfoData.usageDate === todayInLA;
+				const totalUsage = isCurrentDay ? (keyInfoData.usage || 0) : 0;
+				
+				// Get the usage count for the specific model
+				let modelSpecificUsage = 0;
+				if (requestedModelId && isCurrentDay && keyInfoData.modelUsage) {
+					modelSpecificUsage = keyInfoData.modelUsage[requestedModelId] || 0;
+				}
+				
+				// Calculate weight - weight is inversely proportional to usage
+				// Use a small value 1 to prevent division by zero and use an exponential function to make the difference more pronounced
+				const baseWeight = Math.exp(-modelSpecificUsage / 10) * 100;
+				
+				keysWithWeights.push({
 					id: keyId,
 					key: keyInfoData.key || '',
-				};
-				// Quota check is moved to handleV1ChatCompletions
+					weight: baseWeight,
+					usage: totalUsage,
+					modelUsage: modelSpecificUsage
+				});
 			} catch (parseError) {
 				console.error(`Failed to parse key info for ID: ${keyId}. Skipping. Error:`, parseError);
 				continue;
 			}
 		}
 
-		console.error("All Gemini keys seem misconfigured or unusable.");
-		return null;
+		// Check if there are any available keys
+		if (keysWithWeights.length === 0) {
+			console.error("No usable Gemini keys found.");
+			return null;
+		}
+
+		// Sort by weight (high to low) and log
+		keysWithWeights.sort((a, b) => b.weight - a.weight);
+		
+		// Log the sorting results (for debugging)
+		console.log("Keys sorted by weight (higher weight = higher priority):");
+		keysWithWeights.forEach(k => {
+			console.log(`Key: ${k.id}, Model usage: ${k.modelUsage}, Total usage: ${k.usage}, Weight: ${k.weight.toFixed(2)}`);
+		});
+
+		// Use weighted random selection
+		// 1. Calculate the sum of weights
+		const totalWeight = keysWithWeights.reduce((sum, key) => sum + key.weight, 0);
+		
+		// 2. Generate a random number between 0 and totalWeight
+		const randomValue = Math.random() * totalWeight;
+		
+		// 3. Select the key based on weight
+		let cumulativeWeight = 0;
+		for (const keyInfo of keysWithWeights) {
+			cumulativeWeight += keyInfo.weight;
+			if (randomValue <= cumulativeWeight) {
+				console.log(`Selected Gemini Key ID via weighted algorithm: ${keyInfo.id} (weight: ${keyInfo.weight.toFixed(2)}, model usage: ${keyInfo.modelUsage})`);
+				return {
+					id: keyInfo.id,
+					key: keyInfo.key
+				};
+			}
+		}
+		
+		// If no key is selected due to floating-point errors, return the key with the highest weight
+		console.log(`Fallback: Selected highest weighted key: ${keysWithWeights[0].id}`);
+		return {
+			id: keysWithWeights[0].id,
+			key: keysWithWeights[0].key
+		};
 
 	} catch (error) {
 		console.error("Error retrieving or processing Gemini keys from KV:", error);
@@ -1871,21 +2131,39 @@ async function forceSetQuotaToLimit(keyId: string, env: Env, category: 'Pro' | '
 
 		// Set the specific category/model usage to its limit
 		let quotaLimit = Infinity;
+		const modelConfig = modelId ? modelsConfig[modelId] : undefined;
+
 		switch (category) {
 			case 'Pro':
-				quotaLimit = categoryQuotas.proQuota ?? Infinity;
-				categoryUsage.pro = quotaLimit;
-				console.log(`Forcing Pro usage for key ${keyId} to limit: ${quotaLimit}`);
+				// Check if the specific Pro model has an individual quota
+				if (modelConfig?.individualQuota) {
+					quotaLimit = modelConfig.individualQuota;
+					modelUsage[modelId!] = quotaLimit; // modelId must exist here
+					console.log(`Forcing Pro model ${modelId} individual usage for key ${keyId} to limit: ${quotaLimit}`);
+				} else {
+					// No individual quota, force the whole category
+					quotaLimit = categoryQuotas.proQuota ?? Infinity;
+					categoryUsage.pro = quotaLimit;
+					console.log(`Forcing Pro category usage for key ${keyId} to limit: ${quotaLimit}`);
+				}
 				break;
 			case 'Flash':
-				quotaLimit = categoryQuotas.flashQuota ?? Infinity;
-				categoryUsage.flash = quotaLimit;
-				console.log(`Forcing Flash usage for key ${keyId} to limit: ${quotaLimit}`);
+				// Check if the specific Flash model has an individual quota
+				if (modelConfig?.individualQuota) {
+					quotaLimit = modelConfig.individualQuota;
+					modelUsage[modelId!] = quotaLimit; // modelId must exist here
+					console.log(`Forcing Flash model ${modelId} individual usage for key ${keyId} to limit: ${quotaLimit}`);
+				} else {
+					// No individual quota, force the whole category
+					quotaLimit = categoryQuotas.flashQuota ?? Infinity;
+					categoryUsage.flash = quotaLimit;
+					console.log(`Forcing Flash category usage for key ${keyId} to limit: ${quotaLimit}`);
+				}
 				break;
 			case 'Custom':
-				if (modelId && modelsConfig[modelId]) {
-					quotaLimit = modelsConfig[modelId].dailyQuota ?? Infinity;
-					modelUsage[modelId] = quotaLimit;
+				if (modelConfig) {
+					quotaLimit = modelConfig.dailyQuota ?? Infinity;
+					modelUsage[modelId!] = quotaLimit; // modelId must exist here
 					console.log(`Forcing Custom model ${modelId} usage for key ${keyId} to limit: ${quotaLimit}`);
 				} else {
 					console.warn(`Cannot force quota limit for Custom model: modelId '${modelId}' not provided or not found in config.`);
@@ -1909,6 +2187,35 @@ async function forceSetQuotaToLimit(keyId: string, env: Env, category: 'Pro' | '
 
 	} catch (e) {
 		console.error(`Failed to force quota limit for key ${keyId}:`, e);
+	}
+	// Removed extra closing brace here
+}
+
+
+/**
+ * Records a 401 or 403 error status for a given Gemini Key ID in KV.
+ */
+async function recordKeyError(keyId: string, env: Env, status: 401 | 403): Promise<void> {
+	const keyKvName = `key:${keyId}`;
+	try {
+		const keyInfoJson = await env.GEMINI_KEYS_KV.get(keyKvName);
+		if (!keyInfoJson) {
+			console.warn(`Cannot record error: Key info not found for ID: ${keyId}`);
+			return;
+		}
+
+		let keyInfoData = JSON.parse(keyInfoJson) as Partial<GeminiKeyInfo>;
+
+		// Update the error status
+		keyInfoData.errorStatus = status;
+
+		// Put the updated info back into KV
+		await env.GEMINI_KEYS_KV.put(keyKvName, JSON.stringify(keyInfoData));
+		console.log(`Recorded error status ${status} for key ${keyId}.`);
+
+	} catch (e) {
+		console.error(`Failed to record error status for key ${keyId}:`, e);
+		// Don't rethrow here, as recording the error is secondary
 	}
 }
 
